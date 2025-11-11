@@ -1,25 +1,35 @@
 import os
 import cv2
-import numpy as np
 import time
+import shutil
+import numpy as np
+import threading
+from collections import deque
 from utils.detectionSCRFD import SCRFD
 from utils.embeddingsArcface import ArcFace
-from utils.frutility import draw_corners, draw_keypoints
-from utils.byte_tracker import BYTETracker
-from collections import OrderedDict, deque
+from milvusDB import MilvusDB
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from utils.byte_tracker import BYTETracker # asumsi lo udah punya ini
+from collections import OrderedDict
 
+# =====================================================
+# CONFIG
+# =====================================================
 DATABASE_PATH = "database"
-UNKNOWN_FOLDER = "unknown"
-FRAME_RESIZE = (1280, 720)
-
-trackThresh = 0.3
+PROFILE_DIR = "temp/faceProfile"
+MATCH_THRESHOLD = 0.6
+UNKNOWN_FOLDER = "unknown_faces"
+SKIPFRAME = 3
+trackThresh = 0.5
 trackBuffer = 30
-trackerFrameRate = 40
-trackerMatchThresh = 0.6
-MATCH_THRESHOLD = 0.25
-SKIPFRAME = 5
-RECOOLDOWN = 3  # detik
+trackerFrameRate = 30
+trackerMatchThresh = 0.8
 
+
+# =====================================================
+# CLASS
+# =====================================================
 class LimitedDict(OrderedDict):
     def __init__(self, max_size):
         super().__init__()
@@ -31,185 +41,193 @@ class LimitedDict(OrderedDict):
         super().__setitem__(key, value)
         if len(self) > self.max_size:
             self.popitem(last=False)
-    
-# ================================
-# Inisialisasi detector & recognizer
-# ================================
+
+# =====================================================
+# INIT
+# =====================================================
 detector = SCRFD(model_path="models/buffalo_m/det_25g.onnx")
 recognizer = ArcFace(model_path="models/buffalo_m/w600k_r50.onnx")
 
-# =====================================================
-# FACE DATABASE
-# =====================================================
-def build_face_database(folder_path, padding=0):
+os.makedirs(PROFILE_DIR, exist_ok=True)
+os.makedirs(UNKNOWN_FOLDER, exist_ok=True)
+os.makedirs(DATABASE_PATH, exist_ok=True)
 
-    database = []
+
+# =====================================================
+# FUNGSI PROCESS + BUILD DB
+# =====================================================
+def process_image(img_path, faceDB, move_after=True, padding=0):
+    if not os.path.exists(img_path):
+        return
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"[SKIP] Cannot read image: {img_path}")
+        return
+
+    name = os.path.splitext(os.path.basename(img_path))[0].split("-")[0]
+    boxes, points_list = detector.detect(img)
+    if boxes is None or len(boxes) == 0:
+        print(f"[SKIP] No face detected in {img_path}")
+        return
+
+    box, kps = boxes[0], points_list[0]
+    x1, y1, x2, y2, score = box.astype(np.int32)
+    h, w = img.shape[:2]
+    face_crop = img[max(y1, 0):min(y2, h), max(x1, 0):min(x2, w)].copy()
+
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    save_path = os.path.join(PROFILE_DIR, f"{name}.jpg")
+
+    if not os.path.exists(save_path):
+        shutil.move(img_path, save_path)
+        print(f"[SAVE] Moved {img_path} → {save_path}")
+    elif move_after:
+        os.remove(img_path)
+
+    emb = recognizer(img, kps)
+    meta = {"name": name}
+    faceDB.insert(emb, meta, MATCH_THRESHOLD)
+    print(f"[DB] Inserted '{name}' to MilvusDB")
+
+
+def build_face_database(folder_path, faceDB, padding=0):
     print(f"\n[INFO] Building Face Database from '{folder_path}'...")
-
     if not os.path.exists(folder_path):
         print(f"[WARNING] Folder {folder_path} not found!")
-        return database
+        return
+    image_files = [f for f in os.listdir(folder_path)
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    if not image_files:
+        print(f"[WARNING] No image files found in {folder_path}")
+        return
 
-    image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    def sort_key(filename):
+        name, _ = os.path.splitext(filename)
+        parts = name.split("-")
+        if len(parts) > 1 and parts[-1].isdigit():
+            return (parts[0], int(parts[-1]))
+        return (parts[0], 9999)
+
+    image_files.sort(key=sort_key)
     for img_name in image_files:
         img_path = os.path.join(folder_path, img_name)
-        img = cv2.imread(img_path)
-        if img is None:
-            continue
+        process_image(img_path, faceDB, move_after=True, padding=padding)
 
-        # Dapat bounding box & keypoints
-        boxes, points_list = detector.detect(img)
-        if boxes is not None and len(boxes) > 0:
-            # Ambil wajah pertama
-            box, kps = boxes[0], points_list[0]
-            x1, y1, x2, y2, score = box.astype(np.int32)
-
-            # =========================
-            # Crop wajah + padding
-            # =========================
-            h, w = img.shape[:2]
-            x1p = max(x1 - padding, 0)
-            y1p = max(y1 - padding, 0)
-            x2p = min(x2 + padding, w - 1)
-            y2p = min(y2 + padding, h - 1)
-
-            face_crop = img[y1p:y2p, x1p:x2p].copy()
-            cv2.imwrite("crop.jpg", face_crop)
-
-            emb = recognizer(img, kps)
-
-            name = os.path.splitext(img_name)[0].split("-")[0]
-            database.append({"name": name, "embedding": emb})
-            print(f"[OK] Added '{img_name}' as '{name}'")
-
-    print(f"[DONE] Total faces in DB: {len(database)}\n")
-    return database
 
 # =====================================================
-# FACE COMPARISON
+# WATCHER
 # =====================================================
-def compare_embeddings(emb1, emb2):
-    sim = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
-    return sim
+class DatabaseWatcher(FileSystemEventHandler):
+    def __init__(self, faceDB, padding=0):
+        self.faceDB = faceDB
+        self.padding = padding
 
-def get_last_unknown_number(folder_path):
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-        return 0
+    def on_created(self, event):
+        if not event.is_directory and event.src_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+            time.sleep(0.5)
+            print(f"[WATCH] New image detected: {event.src_path}")
+            process_image(event.src_path, self.faceDB, move_after=True, padding=self.padding)
 
-    files = [f for f in os.listdir(folder_path) if f.startswith("unknown-")]
-    if not files:
-        return 0
-    numbers = []
-    for f in files:
-        try:
-            num = int(f.split("-")[1].split(".")[0])
-            numbers.append(num)
-        except Exception:
-            pass
-    return max(numbers) if numbers else 0
 
-cap = cv2.VideoCapture("rtsp://admin:GM_282802@192.168.10.236:554/Streaming/Channels/102")
-FaceDB = build_face_database(DATABASE_PATH)
-unknownNumber = get_last_unknown_number(UNKNOWN_FOLDER) + 1
-tracker = BYTETracker(track_thresh=trackThresh, track_buffer=trackBuffer, frame_rate=trackerFrameRate)
-faceTracked = LimitedDict(10)
-faceKeypoints = LimitedDict(1000)
-recognized_cache = {}
-frameCounting = 0
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+def start_watching(folder_path, faceDB, padding=0):
+    observer = Observer()
+    event_handler = DatabaseWatcher(faceDB, padding)
+    observer.schedule(event_handler, folder_path, recursive=False)
+    observer.start()
+    print(f"[INFO] Watching folder: {folder_path}")
+    observer.join()
 
-    # ====================
-    # Deteksi wajah
-    # ====================
-    if frameCounting % SKIPFRAME == 0:
-        start_time = time.time()
-        cleanFrame = frame.copy()
-        boxes, points_list = detector.detect(frame)
 
-        aligned_faces = []
-        embeddings = []
-        detectedFaces = []
+# =====================================================
+# STREAMING (MAIN LOOP)
+# =====================================================
+def run_stream(faceDB, url):
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        print("[ERROR] Camera not available")
+        return
 
-        if boxes is not None and len(boxes) > 0:
-            for box, kps in zip(boxes, points_list):
-                x1, y1, x2, y2, score = box
-                detectedFaces.append([int(x1), int(y1), int(x2), int(y2), float(score)])
-                faceKeypoints[score] = kps
+    tracker = BYTETracker(track_thresh=trackThresh, track_buffer=trackBuffer, frame_rate=trackerFrameRate)
+    faceTracked = LimitedDict(10)
+    faceKeypoints = LimitedDict(1000)
+    frameCounting = 0
 
-            detectedFaces = np.array(detectedFaces, dtype=np.float32)
-
-            # Tracking
-            tracks = tracker.update(
-                detectedFaces,
-                [frame.shape[0], frame.shape[1]],  # img_info (height, width)
-                [frame.shape[0], frame.shape[1]],  # img_size (height, width)
-                mot20=False,
-                match_thresh=trackerMatchThresh
-            )
-
-            for face in tracks:
-                x1, y1, x2, y2 = map(int, face.tlbr)
-                faceId = face.track_id
-                kps = faceKeypoints[face.score]
-
-                if faceId not in faceTracked:
-                    faceTracked[faceId] = deque(maxlen=10)
-
-                # ====================
-                # Face Recognition
-                # ====================
-                emb = recognizer(cleanFrame, kps)  # Ambil 
-                faceTracked[faceId].append(emb)
-
-                if len(faceTracked[faceId]) >= 5:
-                    mean_embedding = np.mean(faceTracked[faceId], axis=0)
-                    sims = [compare_embeddings(mean_embedding, d["embedding"]) for d in FaceDB] if FaceDB else []
-                    best_sim = max(sims) if sims else 0
-                    best_idx = np.argmax(sims) if sims else -1
-                    name = None
-                    print(f"match : {best_sim}, name : {FaceDB[best_idx]['name']}")
-                    if best_sim >= MATCH_THRESHOLD:
-                        name = FaceDB[best_idx]["name"]
-                    else:
-                        name = "unknown"
-                        # save_path = os.path.join(UNKNOWN_FOLDER, f"unknown-{unknownNumber}.jpeg")
-                        # cv2.imwrite(save_path, frame)
-                        # print(f"[UNKNOWN] Saved new face: {save_path}")
-                        # unknownNumber += 1
-                    
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, name, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    
-
-        end_time = time.time()
-
-        elapsed_ms = (end_time - start_time) * 1000
-        fps = 1000 / elapsed_ms if elapsed_ms > 0 else 0
-        # ====================
-        # Tampilkan FPS
-        # ====================
-        cv2.putText(frame, f"{elapsed_ms:.1f} ms ({fps:.1f} FPS)",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 255, 0), 2)
-        cv2.imshow("FaceDetection", frame)
-
-        # ====================
-        # Tampilkan aligned faces
-        # ====================
-        if len(aligned_faces) > 0:
-            grid = np.hstack([cv2.resize(face, (112, 112)) for face in aligned_faces])
-            cv2.imshow("Aligned Faces", grid)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+    while True:
+        ret, frame = cap.read()
+        if not ret:
             break
-    frameCounting += 1
-    if frameCounting >= 100:
-        frameCounting = 0
 
-cap.release()
-cv2.destroyAllWindows()
+        if frameCounting % SKIPFRAME == 0:
+            start_time = time.time()
+            cleanFrame = frame.copy()
+            boxes, points_list = detector.detect(frame)
+
+            if boxes is not None and len(boxes) > 0:
+                detectedFaces = []
+                for box, kps in zip(boxes, points_list):
+                    x1, y1, x2, y2, score = box
+                    detectedFaces.append([int(x1), int(y1), int(x2), int(y2), float(score)])
+                    faceKeypoints[score] = kps
+                detectedFaces = np.array(detectedFaces, dtype=np.float32)
+
+                tracks = tracker.update(
+                    detectedFaces,
+                    [frame.shape[0], frame.shape[1]],
+                    [frame.shape[0], frame.shape[1]],
+                    mot20=False,
+                    match_thresh=trackerMatchThresh
+                )
+
+                for face in tracks:
+                    x1, y1, x2, y2 = map(int, face.tlbr)
+                    faceId = face.track_id
+                    kps = faceKeypoints[face.score]
+
+                    if faceId not in faceTracked:
+                        faceTracked[faceId] = deque(maxlen=10)
+
+                    emb = recognizer(cleanFrame, kps)
+                    faceTracked[faceId].append(emb)
+
+                    if len(faceTracked[faceId]) >= 5:
+                        mean_emb = np.mean(faceTracked[faceId], axis=0)
+                        results = faceDB.search(mean_emb, 1)
+                        name = "unknown"
+                        print(f"score {results[0]['score']}, name : {results[0]['name']}")
+                        if results and results[0]["score"] >= MATCH_THRESHOLD:
+                            name = results[0]["name"]
+
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(frame, name, (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            elapsed = (time.time() - start_time) * 1000
+            fps = 1000 / elapsed if elapsed > 0 else 0
+            cv2.putText(frame, f"{elapsed:.1f} ms ({fps:.1f} FPS)", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imshow("Face Stream", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+        frameCounting += 1
+        if frameCounting >= 100:
+            frameCounting = 0
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# =====================================================
+# MAIN ENTRY
+# =====================================================
+if __name__ == "__main__":
+    FaceDB = MilvusDB("face_demo.db", dim=512)
+    build_face_database(DATABASE_PATH, FaceDB)
+
+    # Jalankan watcher di thread lain
+    watcher_thread = threading.Thread(target=start_watching, args=(DATABASE_PATH, FaceDB), daemon=True)
+    watcher_thread.start()
+
+    # Jalankan stream di thread utama
+    run_stream(FaceDB, 0)
