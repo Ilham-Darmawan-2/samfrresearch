@@ -161,6 +161,8 @@ def run_stream(faceDB, url):
             start_time = time.time()
             cleanFrame = frame.copy()
             boxes, points_list = detector.detect(frame)
+            endDetectionTime = (time.time()-start_time)* 1000
+            print(f"[INFO] detection time : {endDetectionTime:.2f} ms")
 
             if boxes is not None and len(boxes) > 0:
                 detectedFaces = []
@@ -186,16 +188,26 @@ def run_stream(faceDB, url):
                     if faceId not in faceTracked:
                         faceTracked[faceId] = deque(maxlen=10)
 
+                    embeddingStartTime = time.time()
                     emb = recognizer(cleanFrame, kps)
                     faceTracked[faceId].append(emb)
+                    embeddingEndTime = (time.time()-embeddingStartTime)* 1000
+                    print(f"[INFO] embedding time : {embeddingEndTime:.2f} ms")
 
-                    if len(faceTracked[faceId]) >= 5:
+                    if len(faceTracked[faceId]) >= 3:
+                        meanEmbStartTime = time.time()
                         mean_emb = np.mean(faceTracked[faceId], axis=0)
+                        meanEmbEndTime = (time.time() - meanEmbStartTime)* 1000
+                        print(f"[INFO] mean embedding time : {meanEmbEndTime:.2f} ms")
+                        searchStartTime = time.time()
                         results = faceDB.search(mean_emb, 1)
+                        endSearchTime = (time.time() - searchStartTime)* 1000
+                        print(f"[INFO] search face time in database : {endSearchTime:.2f} ms")
                         name = "unknown"
-                        print(f"score {results[0]['score']}, name : {results[0]['name']}")
-                        if results and results[0]["score"] >= MATCH_THRESHOLD:
-                            name = results[0]["name"]
+                        if len(results):
+                            print(f"score {results[0]['score']}, name : {results[0]['name']}")
+                            if results and results[0]["score"] >= MATCH_THRESHOLD:
+                                name = results[0]["name"]
 
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                         cv2.putText(frame, name, (x1, y1 - 10),
