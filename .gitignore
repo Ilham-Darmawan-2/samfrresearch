@@ -1,3 +1,5 @@
 models/*
 yolox/*
 frenv/*
+milvus.log
+face_demo.db

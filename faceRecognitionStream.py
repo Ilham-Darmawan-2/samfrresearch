@@ -18,9 +18,9 @@ from collections import OrderedDict
 # =====================================================
 DATABASE_PATH = "database"
 PROFILE_DIR = "temp/faceProfile"
-MATCH_THRESHOLD = 0.6
+MATCH_THRESHOLD = 0.5
 UNKNOWN_FOLDER = "unknown_faces"
-SKIPFRAME = 3
+SKIPFRAME = 2
 trackThresh = 0.5
 trackBuffer = 30
 trackerFrameRate = 30
@@ -121,12 +121,30 @@ class DatabaseWatcher(FileSystemEventHandler):
     def __init__(self, faceDB, padding=0):
         self.faceDB = faceDB
         self.padding = padding
+        self.last_processed = 0
+        self.min_interval = 1.0  # detik antar proses
 
     def on_created(self, event):
-        if not event.is_directory and event.src_path.lower().endswith(('.jpg', '.jpeg', '.png')):
-            time.sleep(0.5)
-            print(f"[WATCH] New image detected: {event.src_path}")
-            process_image(event.src_path, self.faceDB, move_after=True, padding=self.padding)
+        if event.is_directory:
+            return
+        if not event.src_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+            return
+
+        now = time.time()
+        if now - self.last_processed < self.min_interval:
+            # Skip event kalau masih dalam interval < 1 detik
+            return
+
+        self.last_processed = now
+        print(f"[WATCH] New image detected: {event.src_path}")
+
+        # Jalanin di thread kecil supaya gak blocking
+        threading.Thread(
+            target=process_image,
+            args=(event.src_path, self.faceDB),
+            kwargs={'move_after': True, 'padding': self.padding},
+            daemon=True
+        ).start()
 
 
 def start_watching(folder_path, faceDB, padding=0):

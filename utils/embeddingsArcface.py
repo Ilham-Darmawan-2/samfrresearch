@@ -6,6 +6,53 @@ from utils.frutility import norm_crop_image
 
 __all__ = "ArcFace"
 
+
+def create_inference_session(model_path: str):
+    available_providers = onnxruntime.get_available_providers()
+    print("Available providers:", available_providers)
+
+    # Default fallback
+    providers = ["CPUExecutionProvider"]
+
+    # NVIDIA GPU (CUDA / TensorRT)
+    if "CUDAExecutionProvider" in available_providers:
+        providers = [
+            ('TensorrtExecutionProvider', {'trt_engine_cache_enable': True}),
+            'CUDAExecutionProvider',
+            'CPUExecutionProvider'
+        ]
+        print("🟢 Using NVIDIA GPU (TensorRT + CUDA)")
+
+    # Intel GPU (OpenVINO)
+    elif "OpenVINOExecutionProvider" in available_providers:
+        providers = [
+            'OpenVINOExecutionProvider',
+            'CPUExecutionProvider'
+        ]
+        print("🔵 Using Intel GPU (OpenVINO)")
+
+    # (Opsional) DirectML / ROCm
+    elif "DmlExecutionProvider" in available_providers:
+        providers = [
+            'DmlExecutionProvider',
+            'CPUExecutionProvider'
+        ]
+        print("🟣 Using DirectML (Windows GPU)")
+
+    elif "ROCMExecutionProvider" in available_providers:
+        providers = [
+            'ROCMExecutionProvider',
+            'CPUExecutionProvider'
+        ]
+        print("🔴 Using AMD GPU (ROCm)")
+
+    else:
+        print("⚪ No GPU provider found — using CPU only")
+
+    session = onnxruntime.InferenceSession(model_path, providers=providers)
+    print("✅ Active providers:", session.get_providers())
+    return session
+
 class ArcFace:
     def __init__(self, model_path: str = None, session=None) -> None:
         self.session = session
@@ -14,14 +61,11 @@ class ArcFace:
         self.taskname = "recognition"
 
         if session is None:
-            self.session = onnxruntime.InferenceSession(
-                model_path,
-                providers=["OpenVINOExecutionProvider", "CPUExecutionProvider"]
-            )
             # self.session = onnxruntime.InferenceSession(
             #     model_path,
-            #     providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            #     providers=["OpenVINOExecutionProvider", "CPUExecutionProvider"]
             # )
+            self.session = create_inference_session(model_path=model_path)
         input_cfg = self.session.get_inputs()[0]
         input_shape = input_cfg.shape
 
